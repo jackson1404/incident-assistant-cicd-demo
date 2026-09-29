@@ -1,0 +1,146 @@
+name: incident-assistant-ci-cd
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: incident-assistant-app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check app tests
+      - run: pytest -q
+
+  build_scan_push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set immutable image tag
+        id: image
+        run: echo "image_tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
+        run: |
+          docker build --platform linux/amd64 \
+            -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ steps.image.outputs.image_tag }}"
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: "HIGH,CRITICAL"
+          vuln-type: "os,library"
+
+      - name: Configure AWS credentials using GitHub OIDC
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - name: Login to ECR
+        if: github.event_name == 'push'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image
+        if: github.event_name == 'push'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image.outputs.image_tag }}
+        run: |
+          docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" \
+            "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+  deploy_dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build_scan_push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Configure AWS deploy credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - name: Deploy to EC2 via SSM Run Command
+        env:
+          INSTANCE_ID: ${{ vars.DEV_EC2_INSTANCE_ID }}
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          PARAMS=$(python - <<'PY'
+          import json, os
+          registry = f"{os.environ['AWS_ACCOUNT_ID']}.dkr.ecr.{os.environ['AWS_REGION']}.amazonaws.com"
+          image = f"{registry}/{os.environ['ECR_REPOSITORY']}:{os.environ['IMAGE_TAG']}"
+          commands = [
+              "set -euo pipefail",
+              f"aws ecr get-login-password --region {os.environ['AWS_REGION']} | docker login --username AWS --password-stdin {registry}",
+              f"docker pull {image}",
+              "docker rm -f incident-app || true",
+              "docker run -d --name incident-app --restart unless-stopped "
+              "-p 127.0.0.1:8000:8000 "
+              "-e ENVIRONMENT=dev "
+              f"-e APP_VERSION={os.environ['IMAGE_TAG']} "
+              "--log-driver=awslogs "
+              f"--log-opt awslogs-region={os.environ['AWS_REGION']} "
+              "--log-opt awslogs-group=/dev/incident-assistant/application "
+              "--log-opt awslogs-stream=incident-app "
+              f"{image}",
+              "sleep 5",
+              "curl -fsS http://127.0.0.1:8000/health",
+          ]
+          print(json.dumps({"commands": commands}))
+          PY
+          )
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID"
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID"
