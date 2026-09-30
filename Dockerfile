@@ -6,10 +6,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN useradd --system --uid 10001 --create-home appuser
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+
+RUN python -m pip install --no-cache-dir \
+        --upgrade \
+        pip \
+        "setuptools>=78.1.1" \
+        "msgpack>=1.2.1" \
+    && python -m pip install \
+        --no-cache-dir \
+        -r requirements.txt \
+    && python -m pip check
 
 COPY --chown=appuser:appuser app ./app
 
