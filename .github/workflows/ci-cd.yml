@@ -81,8 +81,7 @@ jobs:
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
   deploy_dev:
-    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    if: false
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build_scan_push
     runs-on: ubuntu-latest
     permissions:
